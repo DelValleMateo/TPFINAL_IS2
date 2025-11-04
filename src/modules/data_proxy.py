@@ -1,140 +1,105 @@
 # src/modules/data_proxy.py
-
 import sys
 import uuid
+import json
 from datetime import datetime
 from decimal import Decimal
-import botocore
 from botocore.exceptions import ClientError
-import json
-
-# Importamos nuestro módulo Singleton
+# uuid: Para generar IDs únicos para cada entrada de log.
+# datetime: Para poner la fecha y hora (timestamp) en el log.
+# Decimal: Para convertir tipos de datos para DynamoDB.
 from modules.db_singleton import DatabaseSingleton
-
-# *----------------------------------------------------------------------------
-# * UADER-FCyT
-# * Ingeniería de Software II
-# *
-# * data_proxy.py
-# * Módulo que implementa el patrón Proxy para el acceso a datos.
-# * Abstrae el acceso a DynamoDB y gestiona la auditoría.
-# *----------------------------------------------------------------------------
+# Importa el Singleton para obtener la conexión a la BD.
 
 
 class DataProxy:
-    """
-    Implementa el patrón Proxy. Actúa como intermediario para
-    el acceso a los datos corporativos, gestionando también
-    la auditoría de las operaciones.
-    """
-
     def __init__(self):
-        """
-        Inicializa el Proxy obteniendo la instancia única del Singleton
-        y las tablas de base de datos.
-        """
+        # El constructor del Proxy.
         try:
-            self.db_instance = DatabaseSingleton()
-            self.table_data = self.db_instance.get_corporate_data_table()
-            self.table_log = self.db_instance.get_corporate_log_table()
-            print("DataProxy inicializado y listo.")
+            db = DatabaseSingleton()
+            # Línea 15: ¡IMPORTANTE! No crea una conexión nueva.
+            # Pide la instancia ÚNICA que el Singleton administra.
+
+            # Línea 17-18: Guarda las referencias a las tablas que obtuvo del Singleton.
+            self.table_data = db.get_corporate_data_table()
+            self.table_log = db.get_corporate_log_table()
+            print("DataProxy inicializado.")
         except Exception as e:
             print(
                 f"Error fatal al inicializar DataProxy: {e}", file=sys.stderr)
             sys.exit(1)
 
     def _log_action(self, client_uuid, session_id, action, details=""):
-        """
-        Método privado para registrar una acción en la tabla CorporateLog.
-        """
+        # Línea 26: Esta es la FUNCIÓN CLAVE del Proxy.
+        # Es una función "privada" (por el '_') que hace el trabajo de auditoría.
         try:
-            now = datetime.now()
-            ts = now.strftime("%Y-%m-%d %H:%M:%S")
-            log_id = str(uuid.uuid4())  # ID único para la entrada de log
-
-            item_to_log = {
-                'id': log_id,
+            # Línea 29-37: Crea el diccionario 'item' que se guardará en CorporateLog.
+            # Esto cumple con la consigna[cite: 378, 380, 382].
+            item = {
+                'id': str(uuid.uuid4()),  # ID único para ESTA entrada de log
                 'CPUid': str(client_uuid),
                 'sessionid': str(session_id),
-                'timestamp': ts,
-                'action': action,
-                'details': details
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'action': action,  # ej: "get", "set", "list"
+                'details': details  # ej: "ID: UADER-FCYT-IS2"
             }
-
-            self.table_log.put_item(Item=item_to_log)
-            print(
-                f"AUDITORÍA: Acción '{action}' registrada para CPUid {client_uuid}.")
-
-        except ClientError as e:
-            print(
-                f"Error de Boto3 al registrar log: {e.response['Error']['Message']}", file=sys.stderr)
+            # Línea 39: Escribe el 'item' de log en la tabla CorporateLog.
+            # Esta es la escritura de auditoría.
+            self.table_log.put_item(Item=item)
+            print(f"AUDITORÍA: Acción '{action}' registrada.")
         except Exception as e:
-            print(f"Error inesperado al registrar log: {e}", file=sys.stderr)
+            # Línea 42: Si falla la escritura del log (ej. permisos de AWS),
+            # solo imprime el error pero NO detiene el programa.
+            print(f"Error al registrar log: {e}", file=sys.stderr)
+
+    # --- Métodos Públicos (La interfaz del Proxy) ---
 
     def get_item(self, item_id, client_uuid, session_id):
-        """
-        Obtiene un ítem específico de la tabla CorporateData.
-        """
-        self._log_action(client_uuid, session_id, "get",
-                         f"ID solicitado: {item_id}")
+        # --- LÓGICA DEL PROXY ---
+        # 1. Registrar la auditoría (la funcionalidad extra).
+        self._log_action(client_uuid, session_id, "get", f"ID: {item_id}")
 
+        # 2. Ejecutar la acción real.
         try:
-            response = self.table_data.get_item(
-                Key={'id': item_id}
-            )
-            if 'Item' in response:
-                return response['Item'], 200
-            else:
-                return {"error": "Missing ID", "message": f"No se encontró el ítem con id '{item_id}'"}, 404
-
+            response = self.table_data.get_item(Key={'id': item_id})
+            # 3. Devolver el resultado.
+            # Comprueba si el 'Item' existe en la respuesta de AWS.
+            return (response['Item'], 200) if 'Item' in response else ({"error": "Missing ID"}, 404)
         except ClientError as e:
-            return {"error": "DB Error", "message": e.response['Error']['Message']}, 500
+            # Si AWS da un error (ej. tabla no existe, error de throttling).
+            return {"error": e.response['Error']['Message']}, 500
 
     def set_item(self, item_data, client_uuid, session_id):
-        """
-        Crea o actualiza un ítem en la tabla CorporateData.
-        Convierte automáticamente floats de JSON a Decimal para DynamoDB.
-        """
+        # --- LÓGICA DEL PROXY ---
+        # 1. Registrar la auditoría.
+        self._log_action(client_uuid, session_id, "set",
+                         f"ID: {item_data.get('id')}")
+
+        # 2. Ejecutar la acción real.
         try:
-            # Convertir floats a Decimal recursivamente
+            # DynamoDB no acepta 'float' de Python, solo 'Decimal'.
+            # Esta línea es un truco para convertir todos los números en el JSON
+            # de 'float' (ej. 12.3) a 'Decimal' (ej. Decimal('12.3')).
             item_data_decimal = json.loads(
                 json.dumps(item_data), parse_float=Decimal)
 
-            # Log ANTES de la operación
-            self._log_action(client_uuid, session_id, "set",
-                             f"Datos a modificar: {item_data}")
-
-            response = self.table_data.put_item(
-                Item=item_data_decimal
-            )
-
-            status_code = response['ResponseMetadata']['HTTPStatusCode']
-            if status_code == 200:
-                return item_data, 200  # Devuelve el ítem insertado
-            else:
-                return {"error": "Set Failed", "message": "La operación put_item no retornó 200"}, status_code
-
-        except ClientError as e:
-            return {"error": "DB Error", "message": e.response['Error']['Message']}, 500
-        except TypeError as e:
-            return {"error": "Data Error", "message": f"Error de tipo de dato. ¿Campos vacíos? Detalle: {e}"}, 400
+            # Escribe el ítem en la tabla de datos.
+            self.table_data.put_item(Item=item_data_decimal)
+            # Devuelve los datos guardados y un 'OK' (200).
+            return item_data, 200
         except Exception as e:
-            return {"error": "Data Error", "message": str(e)}, 400
+            # Si la conversión de JSON/Decimal falla o el 'put_item' falla.
+            return {"error": str(e)}, 400
 
     def list_items(self, client_uuid, session_id):
-        """
-        Obtiene TODOS los ítems de la tabla CorporateData.
-        """
-        self._log_action(client_uuid, session_id, "list",
-                         "Solicitud de listado completo")
+        # --- LÓGICA DEL PROXY ---
+        # 1. Registrar la auditoría.
+        self._log_action(client_uuid, session_id, "list")
 
+        # 2. Ejecutar la acción real.
         try:
+            # .scan() es la operación de DynamoDB para "leer toda la tabla".
             response = self.table_data.scan()
-
-            if 'Items' in response:
-                return response['Items'], 200
-            else:
-                return {"error": "Scan Failed", "message": "La operación scan no devolvió ítems"}, 500
-
+            return (response['Items'], 200) if 'Items' in response else ([], 200)
         except ClientError as e:
-            return {"error": "DB Error", "message": e.response['Error']['Message']}, 500
+            return {"error": e.response['Error']['Message']}, 500

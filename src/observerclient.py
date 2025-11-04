@@ -1,149 +1,113 @@
 # src/observerclient.py
-
 import socket
 import sys
 import argparse
 import json
 import uuid
 import time
-import os
-
-# *----------------------------------------------------------------------------
-# * UADER-FCyT
-# * Ingeniería de Software II
-# *
-# * observerclient.py
-# * Cliente Observador. Se suscribe al servidor y escucha por
-# * notificaciones de actualización.
-# *----------------------------------------------------------------------------
-
-VERSION = "1.0"
+# 'time' es nuevo aquí: se usa para el 'sleep' del reintento de conexión.
 
 
 def get_cpu_id():
-    """ Obtiene el UUID de la máquina (CPUid). """
-    return str(uuid.getnode())
+    return str(uuid.getnode())  # Igual que el otro cliente[cite: 223].
 
 
-def connect_and_listen(host, port, client_uuid, output_file, verbose):
-    """
-    Función principal que maneja la conexión, suscripción y
-    lógica de reconexión.
-    """
+def connect_and_listen(host, port, client_uuid, verbose):
+    # Prepara el único mensaje que enviará: la solicitud de suscripción.
+    request_json = json.dumps(
+        {"ACTION": "subscribe", "UUID": client_uuid})[cite: 141]
 
-    # Crear el JSON de suscripción
-    subscribe_request = {
-        "ACTION": "subscribe",
-        "UUID": client_uuid
-    }
-    request_json = json.dumps(subscribe_request)
+    # Define el tiempo de reintento, como pide la consigna[cite: 156].
+    retry_delay = 30
 
-    while True:  # Bucle principal de reconexión
+    # --- Bucle 1: El BUCLE DE RECONEXIÓN (Exterior) ---
+    # Si el servidor se cae, el código saldrá al 'except' y luego este 'while'
+    # hará que todo el bloque 'try' se reintente después de 30 segundos.
+    while True:
         try:
+            # --- 1. Conectar y Suscribir ---
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-
-                # --- ESTADO: Conectando ---
                 if verbose:
                     print(f"Intentando conectar a {host}:{port}...")
-                sock.connect((host, port))
+                sock.connect((host, port))  # Intenta conectar.
 
-                # --- ESTADO: Suscribiendo ---
                 if verbose:
-                    print("¡Conectado! Enviando solicitud de suscripción...")
+                    print("¡Conectado! Enviando suscripción...")
+                # Envía la solicitud 'subscribe'.
                 sock.sendall(request_json.encode('utf-8'))
 
-                # Esperar la confirmación de suscripción
-                response_raw = sock.recv(1024)
-                if not response_raw:
-                    raise ConnectionError(
-                        "El servidor cerró la conexión prematuramente.")
-
-                response = json.loads(response_raw.decode('utf-8'))
-                if verbose:
-                    print(f"Respuesta del servidor: {response}")
-
-                if response.get("status") == "OK":
+                # Recibe la PRIMERA respuesta: la confirmación ("status": "OK").
+                response = json.loads(sock.recv(1024).decode('utf-8'))
+                if response.get("status") != "OK":
+                    # Si el servidor rechaza la suscripción, espera y reintenta.
                     print(
-                        f"Suscripción exitosa (UUID: {client_uuid}). Escuchando por notificaciones...")
-                else:
-                    print(
-                        f"Error en la suscripción: {response.get('message')}. Reintentando...")
-                    time.sleep(10)  # Espera antes de reintentar
+                        f"Error de suscripción: {response.get('message')}. Reintentando...")
+                    time.sleep(retry_delay / 2)
+                    # Salta al siguiente ciclo del 'while True' (reintento).
                     continue
 
-                # --- ESTADO: Suscripto/Activo ---
-                # Bucle de escucha de notificaciones
+                print(
+                    f"Suscripción exitosa (UUID: {client_uuid}). Escuchando...")
+
+                # --- Bucle 2: El BUCLE DE ESCUCHA (Interior) ---
+                # Si la suscripción fue exitosa, entra en el bucle de escucha.
                 while True:
+                    # --- Espera por Notificaciones ---
+                    # sock.recv(4096) es "BLOQUEANTE".
+                    # El programa se congela aquí, esperando datos del servidor.
+                    # No usa CPU mientras espera.
                     notification_raw = sock.recv(4096)
+
                     if not notification_raw:
-                        # Conexión cerrada por el servidor
-                        raise ConnectionError("El servidor cerró la conexión.")
+                        # Si recibe 0 bytes, significa que el servidor cerró la conexión.
+                        # Lanza un error para ser capturado por el 'except' de abajo.
+                        raise ConnectionError("Servidor cerró la conexión.")
 
-                    # --- Evento recibido ---
-                    notification_str = notification_raw.decode('utf-8')
+                    # --- Imprimir Notificación ---
+                    # Si recibe datos (una notificación de 'set'), los imprime.
+                    # Cumple la consigna de "mostrará por salida estándar"[cite: 154].
                     print("\n--- NOTIFICACIÓN RECIBIDA ---")
-
                     try:
-                        parsed_json = json.loads(notification_str)
-                        print(json.dumps(parsed_json, indent=4))
-
-                        # Guardar en archivo si se especificó
-                        if output_file:
-                            try:
-                                # 'a' (append) para no sobrescribir
-                                with open(output_file, 'a') as f:
-                                    f.write(json.dumps(
-                                        parsed_json, indent=4) + "\n---\n")
-                                print(
-                                    f"Notificación guardada en {output_file}")
-                            except IOError as e:
-                                print(
-                                    f"Error al escribir en {output_file}: {e}", file=sys.stderr)
-
+                        parsed = json.loads(notification_raw.decode('utf-8'))
+                        # Formateado "bonito".
+                        print(json.dumps(parsed, indent=4))
                     except json.JSONDecodeError:
-                        print(notification_str)  # Imprimir raw si no es JSON
-
+                        print(notification_raw.decode('utf-8'))  # Raw.
                     print("-----------------------------")
-                    print("...escuchando por más notificaciones...")
+                    # El bucle 'while True' interior vuelve arriba, a sock.recv(4096),
+                    # para esperar la *siguiente* notificación.
 
+        # --- 2. Manejo de Desconexión (Requerimiento de la Consigna) ---
         except (socket.error, ConnectionError, ConnectionResetError) as e:
-            # --- ESTADO: Reintentando ---
+            # Si algo falla (la conexión inicial o el 'sock.recv' del bucle interior)...
+            # ...se captura el error aquí.
             print(f"\nError de conexión: {e}", file=sys.stderr)
-            print(f"Diagrama de Estado: (Socket cerrado/ error E/S) -> 'Reintentando'")
-            retry_delay = 30  # 30 segundos según consigna
-            print(
-                f"Se perdió la conexión con el servidor. Reintentando en {retry_delay} segundos...")
+            print(f"Servidor caído. Reintentando en {retry_delay} segundos...")
+            # Espera 30 segundos, como pide la consigna[cite: 156].
             time.sleep(retry_delay)
+            # Al terminar el 'sleep', el 'while True' exterior (Reconexión)
+            # hace que el código vuelva a intentar conectarse desde el principio.
+
         except KeyboardInterrupt:
+            # Si el usuario presiona Ctrl+C.
             print("\nCerrando cliente observador...")
-            break
+            break  # Rompe el 'while True' exterior y termina el programa.
         except Exception as e:
-            print(f"Error inesperado: {e}", file=sys.stderr)
-            time.sleep(10)  # Espera antes de reintentar
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description=f"ObserverClient (versión {VERSION})")
-    parser.add_argument('-s', '--server', default='localhost',
-                        help='Host del servidor (default: localhost)')
-    parser.add_argument('-p', '--port', type=int, default=8080,
-                        help='Puerto TCP del servidor (default: 8080)')
-    parser.add_argument(
-        '-o', '--output', help='(Opcional) Archivo para guardar notificaciones.')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                        help='Activar modo verboso')
-
-    args = parser.parse_args()
-
-    client_uuid = get_cpu_id()
-
-    if args.verbose:
-        print(f"Iniciando ObserverClient para UUID: {client_uuid}")
-
-    connect_and_listen(args.server, args.port, client_uuid,
-                       args.output, args.verbose)
+            # Captura cualquier otro error, espera y reintenta.
+            print(f"Error inesperado: {e}. Reintentando...", file=sys.stderr)
+            time.sleep(retry_delay / 2)
 
 
 if __name__ == "__main__":
-    main()
+    # Lee los argumentos de consola (host, puerto, verboso)[cite: 139].
+    parser = argparse.ArgumentParser(description="Cliente Observador TPFI")
+    parser.add_argument('-s', '--server', default='localhost',
+                        help='Host del servidor')
+    parser.add_argument('-p', '--port', type=int,
+                        default=8080, help='Puerto del servidor')
+    parser.add_argument('-v', '--verbose',
+                        action='store_true', help='Modo verboso')
+    args = parser.parse_args()
+
+    # Llama a la función principal que contiene los bucles infinitos.
+    connect_and_listen(args.server, args.port, get_cpu_id(), args.verbose)
